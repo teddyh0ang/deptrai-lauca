@@ -27,158 +27,186 @@ class Trade:
     amount: float
     timestamp: int
     tx_hash: str
+    title: str
 
 class PolymarketCopyBot:
     def __init__(self):
         # Polymarket API endpoints
-        self.api_base = "https://clob.polymarket.com"
+        self.data_api = "https://data-api.polymarket.com"
         self.gamma_api = "https://gamma-api.polymarket.com"
         
         # Polygon RPC (for on-chain data)
         self.rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
         self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
         
-        # Polymarket contract addresses
-        self.ctf_exchange = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-        self.neg_risk_adapter = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-        
         # State tracking
         self.tracked_wallets: Set[str] = set()
-        self.wallet_creation_times: Dict[str, int] = {}
-        self.recent_trades: Dict[str, List[Trade]] = defaultdict(list)
+        self.wallet_first_seen: Dict[str, int] = {}
+        self.processed_trades: Set[str] = set()
         
         # Configuration
         self.min_trade_amount = 1000  # $1,000 minimum
         self.lookback_hours = 24
         
-    def get_recent_trades(self) -> List[Dict]:
-        """Fetch recent trades from Polymarket API"""
+    def get_wallet_activity(self, wallet: str) -> List[Dict]:
+        """Fetch all activity for a wallet"""
         try:
-            url = f"{self.gamma_api}/trades"
+            url = f"{self.data_api}/activity"
             params = {
-                "limit": 1000,
-                "_t": int(time.time())
+                "user": wallet,
+                "type": "TRADE"
             }
             
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
             
-            trades = response.json()
-            logger.info(f"Fetched {len(trades)} recent trades")
-            return trades
+            return response.json()
             
         except Exception as e:
-            logger.error(f"Error fetching trades: {e}")
+            logger.error(f"Error fetching wallet activity for {wallet}: {e}")
             return []
     
-    def get_wallet_first_activity(self, wallet: str) -> int:
-        """Get timestamp of wallet's first activity on Polymarket"""
-        try:
-            url = f"{self.gamma_api}/trades"
-            params = {
-                "maker": wallet,
-                "limit": 1
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            trades = response.json()
-            if trades:
-                return trades[0].get("timestamp", 0)
-            
-            return 0
-            
-        except Exception as e:
-            logger.error(f"Error getting wallet activity for {wallet}: {e}")
-            return 0
-    
     def is_new_wallet(self, wallet: str, current_time: int) -> bool:
-        """Check if wallet was created within lookback period"""
-        if wallet in self.wallet_creation_times:
-            creation_time = self.wallet_creation_times[wallet]
+        """Check if wallet is new (first trade within lookback period)"""
+        if wallet in self.wallet_first_seen:
+            first_seen = self.wallet_first_seen[wallet]
         else:
-            creation_time = self.get_wallet_first_activity(wallet)
-            self.wallet_creation_times[wallet] = creation_time
+            # Fetch wallet's activity
+            activity = self.get_wallet_activity(wallet)
+            
+            if not activity:
+                return False
+            
+            # Get earliest timestamp
+            timestamps = [act.get("timestamp", 0) for act in activity]
+            first_seen = min(timestamps) if timestamps else 0
+            self.wallet_first_seen[wallet] = first_seen
         
-        if creation_time == 0:
+        if first_seen == 0:
             return False
         
         cutoff_time = current_time - (self.lookback_hours * 3600)
-        return creation_time >= cutoff_time
+        return first_seen >= cutoff_time
     
-    def analyze_trades(self, trades: List[Dict]) -> List[Trade]:
-        """Analyze trades and filter for large trades from new wallets"""
-        current_time = int(time.time())
-        significant_trades = []
+    def scan_for_new_wallets(self) -> List[str]:
+        """
+        Scan blockchain for new wallet activity
+        This is a simplified version - in production you'd want to:
+        1. Monitor the CTF Exchange contract for OrderFilled events
+        2. Use a service like Alchemy or Infura with webhooks
+        3. Or use Polymarket's WebSocket API
+        """
+        logger.info("Scanning for new wallets...")
         
-        for trade_data in trades:
-            try:
-                wallet = trade_data.get("maker_address", "").lower()
-                if not wallet:
+        # For this demo, we'll fetch recent trades from known markets
+        # In production, you'd monitor the blockchain or use WebSocket feeds
+        try:
+            url = f"{self.gamma_api}/events"
+            params = {"limit": 20, "active": "true"}
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            events = response.json()
+            new_wallets = []
+            
+            # For each market, check recent holders
+            for event in events:
+                markets = event.get("markets", [])
+                for market in markets:
+                    condition_id = market.get("conditionId")
+                    if condition_id:
+                        # Get holders/traders for this market
+                        holders = self.get_market_holders(condition_id)
+                        new_wallets.extend(holders)
+            
+            return list(set(new_wallets))  # Remove duplicates
+            
+        except Exception as e:
+            logger.error(f"Error scanning for wallets: {e}")
+            return []
+    
+    def get_market_holders(self, condition_id: str) -> List[str]:
+        """Get wallets that hold positions in a market"""
+        try:
+            url = f"{self.data_api}/holders"
+            params = {"conditionId": condition_id, "limit": 50}
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            holders_data = response.json()
+            return [h.get("user", "").lower() for h in holders_data]
+            
+        except Exception as e:
+            logger.debug(f"Could not fetch holders for {condition_id}: {e}")
+            return []
+    
+    def check_wallet_trades(self, wallet: str, current_time: int) -> List[Trade]:
+        """Check if a wallet has made large trades recently"""
+        try:
+            # Get recent activity
+            activity = self.get_wallet_activity(wallet)
+            
+            significant_trades = []
+            cutoff_time = current_time - (self.lookback_hours * 3600)
+            
+            for trade_data in activity:
+                trade_type = trade_data.get("type")
+                if trade_type != "TRADE":
                     continue
                 
-                # Check if new wallet
-                if not self.is_new_wallet(wallet, current_time):
+                timestamp = trade_data.get("timestamp", 0)
+                if timestamp < cutoff_time:
                     continue
                 
-                # Calculate trade amount in USD
-                price = float(trade_data.get("price", 0))
-                size = float(trade_data.get("size", 0))
-                amount = price * size
+                # Calculate trade amount
+                usdc_size = float(trade_data.get("usdcSize", 0))
                 
                 # Filter by minimum amount
-                if amount < self.min_trade_amount:
+                if usdc_size < self.min_trade_amount:
                     continue
+                
+                # Create unique trade ID
+                tx_hash = trade_data.get("transactionHash", "")
+                trade_id = f"{wallet}_{tx_hash}_{timestamp}"
+                
+                # Skip if already processed
+                if trade_id in self.processed_trades:
+                    continue
+                
+                self.processed_trades.add(trade_id)
                 
                 trade = Trade(
                     wallet=wallet,
-                    market_id=trade_data.get("market", ""),
+                    market_id=trade_data.get("conditionId", ""),
                     outcome=trade_data.get("outcome", ""),
-                    amount=amount,
-                    timestamp=trade_data.get("timestamp", 0),
-                    tx_hash=trade_data.get("transaction_hash", "")
+                    amount=usdc_size,
+                    timestamp=timestamp,
+                    tx_hash=tx_hash,
+                    title=trade_data.get("title", "Unknown Market")
                 )
                 
                 significant_trades.append(trade)
-                self.tracked_wallets.add(wallet)
                 
-                logger.info(
-                    f"NEW WALLET TRADE: {wallet[:10]}... "
-                    f"traded ${amount:.2f} on market {trade.market_id[:10]}..."
-                )
-                
-            except Exception as e:
-                logger.error(f"Error analyzing trade: {e}")
-                continue
-        
-        return significant_trades
-    
-    def get_market_details(self, market_id: str) -> Dict:
-        """Get market information"""
-        try:
-            url = f"{self.gamma_api}/markets/{market_id}"
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json()
+            return significant_trades
+            
         except Exception as e:
-            logger.error(f"Error fetching market {market_id}: {e}")
-            return {}
+            logger.error(f"Error checking trades for {wallet}: {e}")
+            return []
     
     def execute_copy_trade(self, trade: Trade):
         """Execute a copy trade (placeholder - implement with your strategy)"""
-        market_details = self.get_market_details(trade.market_id)
-        market_question = market_details.get("question", "Unknown")
-        
         logger.info(f"""
         ═══════════════════════════════════════════════════════
-        COPY TRADE SIGNAL
+        🚨 COPY TRADE SIGNAL 🚨
         ═══════════════════════════════════════════════════════
         Wallet: {trade.wallet}
-        Market: {market_question}
+        Market: {trade.title}
         Outcome: {trade.outcome}
-        Amount: ${trade.amount:.2f}
-        Time: {datetime.fromtimestamp(trade.timestamp)}
+        Amount: ${trade.amount:,.2f}
+        Time: {datetime.fromtimestamp(trade.timestamp).strftime('%Y-%m-%d %H:%M:%S')}
+        Tx: {trade.tx_hash[:20]}...
         ═══════════════════════════════════════════════════════
         """)
         
@@ -186,41 +214,67 @@ class PolymarketCopyBot:
         # This would involve:
         # 1. Connecting your wallet
         # 2. Checking available balance
-        # 3. Placing order via Polymarket API
+        # 3. Placing order via Polymarket CLOB API
         # 4. Managing risk and position sizing
     
     def run(self, interval: int = 60):
         """Main bot loop"""
-        logger.info("Starting Polymarket Copy Trading Bot...")
-        logger.info(f"Monitoring for trades > ${self.min_trade_amount}")
-        logger.info(f"Tracking wallets created in last {self.lookback_hours} hours")
+        logger.info("🤖 Starting Polymarket Copy Trading Bot...")
+        logger.info(f"💰 Monitoring for trades > ${self.min_trade_amount:,}")
+        logger.info(f"⏰ Tracking wallets created in last {self.lookback_hours} hours")
+        logger.info("=" * 60)
         
         while True:
             try:
-                # Fetch recent trades
-                trades = self.get_recent_trades()
+                current_time = int(time.time())
                 
-                # Analyze for significant trades from new wallets
-                significant_trades = self.analyze_trades(trades)
+                # Scan for new wallets
+                potential_wallets = self.scan_for_new_wallets()
+                logger.info(f"Found {len(potential_wallets)} potential wallets to check")
                 
-                # Execute copy trades
-                for trade in significant_trades:
-                    self.execute_copy_trade(trade)
+                new_wallet_count = 0
+                total_trades_found = 0
+                
+                # Check each wallet
+                for wallet in potential_wallets:
+                    if not wallet:
+                        continue
+                    
+                    # Check if wallet is new
+                    if not self.is_new_wallet(wallet, current_time):
+                        continue
+                    
+                    new_wallet_count += 1
+                    self.tracked_wallets.add(wallet)
+                    
+                    # Check for large trades
+                    trades = self.check_wallet_trades(wallet, current_time)
+                    
+                    if trades:
+                        logger.info(f"✅ NEW WALLET: {wallet[:10]}... made {len(trades)} large trade(s)")
+                        
+                        for trade in trades:
+                            self.execute_copy_trade(trade)
+                            total_trades_found += 1
                 
                 # Summary
-                logger.info(
-                    f"Tracking {len(self.tracked_wallets)} new wallets | "
-                    f"Found {len(significant_trades)} significant trades"
-                )
+                logger.info(f"""
+📊 Scan Summary:
+   - New wallets found: {new_wallet_count}
+   - Total wallets tracked: {len(self.tracked_wallets)}
+   - Significant trades: {total_trades_found}
+   - Next scan in {interval} seconds
+{"-" * 60}
+                """)
                 
                 # Wait before next iteration
                 time.sleep(interval)
                 
             except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
+                logger.info("🛑 Bot stopped by user")
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"❌ Error in main loop: {e}")
                 time.sleep(interval)
 
 def main():
